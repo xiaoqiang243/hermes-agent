@@ -39,10 +39,13 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 
     Direct api.openai.com endpoints need the Responses API for GPT-5.x
     tool calls with reasoning (chat/completions returns 400).
+    Kimi /coding/v1 endpoints use anthropic_messages format.
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
     if "api.openai.com" in normalized and "openrouter" not in normalized:
         return "codex_responses"
+    if "api.kimi.com/coding" in normalized:
+        return "anthropic_messages"
     return None
 
 
@@ -633,6 +636,11 @@ def _resolve_explicit_runtime(
                 api_mode = configured_mode
             elif base_url.rstrip("/").endswith("/anthropic"):
                 api_mode = "anthropic_messages"
+            else:
+                # Auto-detect from URL (Kimi /coding/v1, OpenAI direct, etc.)
+                detected = _detect_api_mode_for_url(base_url)
+                if detected:
+                    api_mode = detected
 
         return {
             "provider": provider,
