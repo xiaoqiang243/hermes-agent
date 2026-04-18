@@ -190,6 +190,8 @@ def _resolve_runtime_from_pool_entry(
             api_mode = opencode_model_api_mode(provider, model_cfg.get("default", ""))
         elif base_url.rstrip("/").endswith("/anthropic"):
             api_mode = "anthropic_messages"
+        elif "api.kimi.com/coding" in base_url:
+            api_mode = "anthropic_messages"
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
