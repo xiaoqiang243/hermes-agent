@@ -17,8 +17,11 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import json
 import logging
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm
@@ -78,6 +81,77 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self._previous_summary = None
+
+    def _save_compaction_checkpoint(self, turns_to_summarize: List[Dict[str, Any]], all_messages: List[Dict[str, Any]]) -> None:
+        """Save recent critical messages before compression discards them.
+
+        Writes to ~/.hermes/state/compaction_checkpoint.json so the agent
+        can resume context after compaction or restart.
+        """
+        # Extract last N user/assistant messages for continuity.
+        # Use turns_to_summarize (the raw messages being compressed) instead of
+        # all_messages (which may already contain empty/summary messages) to
+        # capture the actual conversation content before it is discarded.
+        _recent = []
+        for msg in reversed(turns_to_summarize):
+            role = msg.get("role", "")
+            if role in ("user", "assistant"):
+                content = msg.get("content", "") or ""
+                # Skip compaction summaries themselves and empty content
+                if "[CONTEXT COMPACTION" in content or "[CONTEXT SUMMARY]" in content:
+                    continue
+                if not content.strip():
+                    continue
+                _recent.append({"role": role, "content": content[:500]})
+            if len(_recent) >= 6:
+                break
+        
+        # Fallback: if turns_to_summarize has no meaningful content,
+        # try the tail of all_messages (post-compression messages)
+        if not _recent:
+            for msg in reversed(all_messages):
+                role = msg.get("role", "")
+                if role in ("user", "assistant"):
+                    content = msg.get("content", "") or ""
+                    if "[CONTEXT COMPACTION" in content or "[CONTEXT SUMMARY]" in content:
+                        continue
+                    if not content.strip():
+                        continue
+                    _recent.append({"role": role, "content": content[:500]})
+                if len(_recent) >= 6:
+                    break
+
+        # Also grab the last few tool calls for state awareness
+        _recent_tools = []
+        for msg in reversed(all_messages):
+            if msg.get("role") == "tool" and msg.get("tool_name"):
+                _recent_tools.append({
+                    "tool": msg.get("tool_name"),
+                    "result_preview": str(msg.get("content", ""))[:200],
+                })
+            if len(_recent_tools) >= 3:
+                break
+
+        checkpoint = {
+            "timestamp": datetime.now().isoformat(),
+            "reason": "Context compaction - preserving recent context",
+            "compaction_count": self.compression_count,
+            "recent_messages": list(reversed(_recent)),
+            "recent_tools": list(reversed(_recent_tools)),
+            "summarized_turns": len(turns_to_summarize),
+        }
+
+        try:
+            _state_dir = Path.home() / ".hermes" / "state"
+            _state_dir.mkdir(parents=True, exist_ok=True)
+            _checkpoint_path = _state_dir / "compaction_checkpoint.json"
+            with open(_checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+            logger.info("Compaction checkpoint saved: %s", _checkpoint_path)
+        except Exception as e:
+            logger.warning("Failed to write compaction checkpoint: %s", e)
+            import traceback
+            logger.warning("Checkpoint save traceback: %s", traceback.format_exc())
 
     def update_model(
         self,
@@ -714,6 +788,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             return messages
 
         turns_to_summarize = messages[compress_start:compress_end]
+
+        # Phase 2.5: Save restart checkpoint before discarding context
+        # This preserves recent critical info so the agent can continue work
+        # after compaction without losing track of what was being done.
+        try:
+            self._save_compaction_checkpoint(turns_to_summarize, messages)
+            if not self.quiet_mode:
+                logger.info("Compaction checkpoint saved successfully")
+        except Exception as e:
+            logger.warning("Compaction checkpoint save failed: %s", e)
+            import traceback
+            logger.debug("Checkpoint save traceback: %s", traceback.format_exc())
 
         if not self.quiet_mode:
             logger.info(

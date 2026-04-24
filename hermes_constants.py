@@ -6,6 +6,7 @@ without risk of circular imports.
 
 import os
 from pathlib import Path
+from typing import Optional
 
 
 def get_hermes_home() -> Path:
@@ -14,7 +15,8 @@ def get_hermes_home() -> Path:
     Reads HERMES_HOME env var, falls back to ~/.hermes.
     This is the single source of truth — all other copies should import this.
     """
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    val = os.environ.get("HERMES_HOME", "").strip()
+    return Path(val) if val else Path.home() / ".hermes"
 
 
 def get_default_hermes_root() -> Path:
@@ -56,7 +58,7 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
-def get_optional_skills_dir(default: Path | None = None) -> Path:
+def get_optional_skills_dir(default: Optional[Path] = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 
     Packaged installs may ship ``optional-skills`` outside the Python package
@@ -168,7 +170,7 @@ def is_termux() -> bool:
     return bool(os.getenv("TERMUX_VERSION") or "com.termux/files/usr" in prefix)
 
 
-_wsl_detected: bool | None = None
+_wsl_detected: Optional[bool] = None
 
 
 def is_wsl() -> bool:
@@ -189,7 +191,7 @@ def is_wsl() -> bool:
     return _wsl_detected
 
 
-_container_detected: bool | None = None
+_container_detected: Optional[bool] = None
 
 
 def is_container() -> bool:
