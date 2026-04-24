@@ -1416,6 +1416,201 @@ class GatewayRunner:
             except Exception:
                 pass
 
+    def _save_restart_checkpoint(self) -> None:
+        """Save restart checkpoint before shutdown so agent can resume context after restart.
+
+        Extracts recent conversation context from active sessions and writes
+        to ~/.hermes/state/gateway_restart_checkpoint.json in the format expected by
+        the startup recovery logic (current_task, modified_files, etc.).
+        """
+        logger.info("[CHECKPOINT DEBUG] _save_restart_checkpoint() called")
+        try:
+            # Find the most recently active session
+            _recent_session = None
+            _recent_messages = []
+            _session_id = None
+
+            logger.info("[CHECKPOINT DEBUG] _running_agents count: %d", len(self._running_agents))
+            
+            # Try active agents first (they have the most current context)
+            for session_key, agent in list(self._running_agents.items()):
+                if agent is _AGENT_PENDING_SENTINEL:
+                    logger.info("[CHECKPOINT DEBUG] Skipping PENDING_SENTINEL for session %s", session_key)
+                    continue
+                # Try to get conversation history from agent
+                _history = getattr(agent, "conversation_history", None) or []
+                logger.info("[CHECKPOINT DEBUG] Agent for session %s has %d history messages", session_key, len(_history))
+                if _history:
+                    _recent_messages = _history
+                    _session_id = getattr(agent, "session_id", None)
+                    logger.info("[CHECKPOINT DEBUG] Using agent history, session_id: %s", _session_id)
+                    break
+
+            # Fallback: load from session_store if no active agent history
+            if not _recent_messages and hasattr(self, "session_store") and self.session_store:
+                logger.info("[CHECKPOINT DEBUG] No active agent history, trying session_store fallback")
+                # Find the most recently updated session
+                _latest_entry = None
+                _latest_time = None
+                logger.info("[CHECKPOINT DEBUG] session_store entries count: %d", len(self.session_store._entries))
+                for key, entry in self.session_store._entries.items():
+                    if _latest_time is None or entry.updated_at > _latest_time:
+                        _latest_time = entry.updated_at
+                        _latest_entry = entry
+                if _latest_entry:
+                    _session_id = _latest_entry.session_id
+                    _recent_messages = self.session_store.load_transcript(_session_id)
+                    logger.info("[CHECKPOINT DEBUG] Loaded %d messages from session_store fallback", len(_recent_messages))
+                else:
+                    logger.info("[CHECKPOINT DEBUG] No entries found in session_store")
+
+            if not _recent_messages:
+                logger.info("[CHECKPOINT DEBUG] No recent messages found for restart checkpoint")
+                return
+
+            # Extract checkpoint fields from conversation history
+            logger.info("[CHECKPOINT DEBUG] Extracting checkpoint from %d messages", len(_recent_messages))
+            _checkpoint = self._extract_restart_checkpoint(_recent_messages)
+            if not _checkpoint:
+                logger.info("[CHECKPOINT DEBUG] _extract_restart_checkpoint returned None")
+                return
+
+            logger.info("[CHECKPOINT DEBUG] Checkpoint extracted, keys: %s", list(_checkpoint.keys()))
+
+            # Write checkpoint file to state dir — matches the reader at line 1764
+            # which reads from ~/.hermes/state/gateway_restart_checkpoint.json
+            _state_dir = _hermes_home / "state"
+            _state_dir.mkdir(parents=True, exist_ok=True)
+            _checkpoint_path = _state_dir / "gateway_restart_checkpoint.json"
+
+            with open(_checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(_checkpoint, f, ensure_ascii=False, indent=2)
+            logger.info("[CHECKPOINT DEBUG] Restart checkpoint saved to: %s", _checkpoint_path)
+            logger.info("[CHECKPOINT DEBUG] Restart checkpoint saved: %s", _checkpoint.get("current_task", "unknown"))
+
+        except Exception as e:
+            logger.error("[CHECKPOINT DEBUG] Failed to save restart checkpoint: %s", e, exc_info=True)
+
+    def _extract_restart_checkpoint(self, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Extract restart checkpoint fields from conversation history.
+
+        Looks for:
+        - current_task: from recent user/assistant messages describing what is being done
+        - modified_files: from tool results mentioning file paths
+        - pending_verification: from assistant messages mentioning verification/confirmation
+        - context_summary: brief summary of recent context
+        """
+        if not messages:
+            return None
+
+        _checkpoint: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Extract last few user/assistant messages for task context
+        _recent_user_assistant = []
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role in ("user", "assistant"):
+                content = msg.get("content", "") or ""
+                # Skip compaction summaries and empty content
+                if "[CONTEXT COMPACTION" in content or "[CONTEXT SUMMARY]" in content:
+                    continue
+                if not content.strip():
+                    continue
+                _recent_user_assistant.append({"role": role, "content": content[:800]})
+            if len(_recent_user_assistant) >= 4:
+                break
+        _recent_user_assistant = list(reversed(_recent_user_assistant))
+
+        # Determine current_task from most recent user message or assistant response
+        _current_task = None
+        for msg in _recent_user_assistant:
+            if msg["role"] == "user":
+                # User's last message is the current task
+                _current_task = msg["content"][:300]
+                break
+        if not _current_task and _recent_user_assistant:
+            # Fallback: use last assistant message (describing what was done)
+            _current_task = _recent_user_assistant[-1]["content"][:300]
+
+        if _current_task:
+            _checkpoint["current_task"] = {
+                "status": "in_progress",
+                "title": _current_task[:200],
+                "progress": f"已保存{len(_recent_messages)}条对话历史",
+                "next_step": "继续执行当前任务",
+            }
+
+        # Extract modified files from tool results
+        _modified_files = []
+        _seen_files = set()
+        for msg in reversed(messages):
+            if msg.get("role") == "tool":
+                content = str(msg.get("content", ""))
+                # Look for file paths in tool results (patch, write_file, terminal output)
+                import re
+                # Match common file path patterns in tool output
+                _file_patterns = [
+                    r'[\'"\s](/[\w./-]+\.(?:py|js|ts|json|yaml|yml|md|txt|sh|css|html))',
+                    r'(?:written to|saved to|modified|patched|created)\s+[`\']?([\w./-]+\.(?:py|js|ts|json|yaml|yml|md|txt|sh|css|html))',
+                    r'\b(\w+/\w+\.(?:py|js|ts|json|yaml|yml|md|txt|sh|css|html))\b',
+                ]
+                for pattern in _file_patterns:
+                    for match in re.finditer(pattern, content, re.IGNORECASE):
+                        _path = match.group(1)
+                        if _path and _path not in _seen_files and len(_path) > 3:
+                            _seen_files.add(_path)
+                            _modified_files.append(_path)
+            if len(_modified_files) >= 10:
+                break
+
+        if _modified_files:
+            _checkpoint["modified_files"] = _modified_files[:10]
+
+        # Extract pending verification items
+        _pending = []
+        for msg in _recent_user_assistant:
+            content = msg["content"]
+            # Look for phrases indicating pending items
+            _pending_indicators = [
+                "待确认", "pending", "待验证", "需要确认", "请确认",
+                "验证", "确认", "检查", "review", "verify", "confirm",
+            ]
+            for indicator in _pending_indicators:
+                if indicator in content.lower():
+                    # Extract the sentence containing the indicator
+                    _sentences = content.split("。")
+                    for sent in _sentences:
+                        if indicator in sent.lower() and len(sent.strip()) > 5:
+                            _pending.append(sent.strip()[:200])
+                    break
+        # Deduplicate
+        _pending = list(dict.fromkeys(_pending))[:5]
+        if _pending:
+            _checkpoint["pending_verification"] = _pending
+
+        # Build context summary from recent messages
+        _summary_parts = []
+        for msg in _recent_user_assistant[-2:]:  # Last 2 messages
+            _content = msg["content"][:200]
+            if msg["role"] == "user":
+                _summary_parts.append(f"User: {_content}")
+            else:
+                _summary_parts.append(f"Agent: {_content}")
+        if _summary_parts:
+            _checkpoint["context_summary"] = " | ".join(_summary_parts)
+
+        # Save raw recent messages for full context recovery after restart
+        # This allows the agent to see the actual conversation history, not just summaries
+        if _recent_user_assistant:
+            _checkpoint["recent_messages"] = _recent_user_assistant[-6:]  # Last 3 exchanges (6 messages)
+
+        # Only return checkpoint if we have meaningful content
+        if len(_checkpoint) > 1:  # More than just timestamp
+            return _checkpoint
+        return None
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
@@ -1558,6 +1753,35 @@ class GatewayRunner:
                     logger.info("Suspended %d in-flight session(s) from previous run", suspended)
             except Exception as e:
                 logger.warning("Session suspension on startup failed: %s", e)
+
+        # ── Restart checkpoint recovery ──
+        # Load restart checkpoint if present, so the agent can resume context
+        # after a gateway restart without the user having to repeat themselves.
+        self._restart_checkpoint = None
+        logger.info("[CHECKPOINT DEBUG] Starting checkpoint recovery...")
+        try:
+            _checkpoint_path = _hermes_home / "state" / "gateway_restart_checkpoint.json"
+            logger.info("[CHECKPOINT DEBUG] Checking path: %s", _checkpoint_path)
+            logger.info("[CHECKPOINT DEBUG] Path exists: %s", _checkpoint_path.exists())
+            if _checkpoint_path.exists():
+                import json
+                logger.info("[CHECKPOINT DEBUG] Reading checkpoint file...")
+                with open(_checkpoint_path, "r", encoding="utf-8") as f:
+                    self._restart_checkpoint = json.load(f)
+                logger.info("[CHECKPOINT DEBUG] Loaded restart checkpoint: %s", self._restart_checkpoint.get("current_task", "unknown"))
+                logger.info("[CHECKPOINT DEBUG] Checkpoint has recent_messages: %s", "recent_messages" in self._restart_checkpoint)
+                if "recent_messages" in self._restart_checkpoint:
+                    logger.info("[CHECKPOINT DEBUG] recent_messages count: %d", len(self._restart_checkpoint["recent_messages"]))
+                # Clear the checkpoint so it's not re-read on next restart
+                try:
+                    _checkpoint_path.unlink()
+                    logger.info("[CHECKPOINT DEBUG] Checkpoint file deleted after loading")
+                except Exception as e:
+                    logger.warning("[CHECKPOINT DEBUG] Failed to delete checkpoint file: %s", e)
+            else:
+                logger.info("[CHECKPOINT DEBUG] No checkpoint file found at startup")
+        except Exception as e:
+            logger.error("[CHECKPOINT DEBUG] Restart checkpoint load failed: %s", e, exc_info=True)
 
         connected_count = 0
         enabled_platform_count = 0
@@ -2039,6 +2263,11 @@ class GatewayRunner:
                     await self._launch_detached_restart_command()
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart: %s", e)
+
+            # Save restart checkpoint BEFORE finalizing agents so we can still
+            # read their conversation_history. After _finalize_shutdown_agents,
+            # agents are closed and their history is no longer accessible.
+            self._save_restart_checkpoint()
 
             self._finalize_shutdown_agents(active_agents)
 
@@ -3147,6 +3376,39 @@ class GatewayRunner:
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         
+        # Check for CheckPoint file — restore task state after context compaction/restart
+        checkpoint_note = ""
+        try:
+            from pathlib import Path
+            checkpoint_dir = Path.home() / ".hermes" / "checkpoints"
+            if checkpoint_dir.exists():
+                # Find most recent checkpoint for this session
+                checkpoints = sorted(
+                    [f for f in checkpoint_dir.glob("*.json") if f.is_file()],
+                    key=lambda f: f.stat().st_mtime,
+                    reverse=True
+                )
+                for cp_file in checkpoints[:3]:  # Check 3 most recent
+                    try:
+                        with open(cp_file, 'r', encoding='utf-8') as f:
+                            cp_data = json.load(f)
+                        # Only use checkpoints from last 24h
+                        cp_time = datetime.fromisoformat(cp_data.get("timestamp", "1970-01-01"))
+                        if (datetime.now() - cp_time).total_seconds() < 86400:
+                            task = cp_data.get("current_task", {})
+                            if task.get("status") == "in_progress":
+                                checkpoint_note = (
+                                    f"\n[CheckPoint: 压缩/重启前正在进行的任务]\n"
+                                    f"任务: {task.get('title', 'Unknown')}\n"
+                                    f"进度: {task.get('progress', 'N/A')}\n"
+                                    f"下一步: {task.get('next_step', 'N/A')}\n"
+                                )
+                                break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
@@ -3157,7 +3419,12 @@ class GatewayRunner:
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
-            context_prompt = context_note + "\n\n" + context_prompt
+            
+            # Append checkpoint note if available
+            if checkpoint_note:
+                context_prompt = context_note + "\n" + checkpoint_note + "\n" + context_prompt
+            else:
+                context_prompt = context_note + "\n\n" + context_prompt
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -7760,6 +8027,8 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
             try:
@@ -8010,6 +8279,24 @@ class GatewayRunner:
                                     entry[_rkey] = _rval
                         agent_history.append(entry)
             
+            # ── Inject restart checkpoint messages into conversation history ──
+            # This allows the agent to see the actual pre-restart conversation
+            # as part of its context, not just a summary in the system prompt.
+            if getattr(self, "_restart_checkpoint", None):
+                cp = self._restart_checkpoint
+                if cp.get("recent_messages"):
+                    # Prepend checkpoint messages to agent_history
+                    _checkpoint_msgs = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in cp["recent_messages"]
+                        if m.get("role") in ("user", "assistant") and m.get("content")
+                    ]
+                    if _checkpoint_msgs:
+                        agent_history = _checkpoint_msgs + agent_history
+                        logger.info("Injected %d checkpoint messages into conversation history", len(_checkpoint_msgs))
+                # Clear after first use
+                self._restart_checkpoint = None
+
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
