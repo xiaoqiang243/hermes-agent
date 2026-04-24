@@ -150,6 +150,10 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+    - **CRITICAL**: Also forces override of launchd-injected env vars by
+      directly updating `os.environ` after dotenv loads. This ensures `.env`
+      is always the single source of truth, even when Gateway is started via
+      launchd with hardcoded env vars in the plist.
     """
     loaded: list[Path] = []
 
@@ -171,4 +175,39 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
+    # Force override launchd-injected env vars with .env values (#8908).
+    # launchd plist env vars are injected at process startup and take
+    # precedence over dotenv. We must explicitly sync them.
+    if user_env.exists():
+        _force_override_from_env_file(user_env)
+
     return loaded
+
+
+def _force_override_from_env_file(env_path: Path) -> None:
+    """Force-update os.environ with values from .env, overriding launchd.
+
+    python-dotenv's `override=True` only affects variables it *sets* during
+    load. If a variable was already in os.environ before dotenv runs (e.g.
+    injected by launchd), dotenv won't overwrite it. This function reads
+    the .env file directly and forces os.environ to match.
+    """
+    try:
+        with open(env_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                # Remove surrounding quotes if present
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                # Skip masked values (***) — plist has the real key, don't overwrite it
+                if key and value and value != "***" and not value.startswith("***"):
+                    os.environ[key] = value
+    except Exception:
+        pass  # best-effort — don't block gateway startup
