@@ -6785,6 +6785,49 @@ class AIAgent:
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
 
+        # ── Inject pre-compression checkpoint so agent knows what was being done ──
+        # The compress() call above saved recent_messages to compaction_checkpoint.json.
+        # Read it and inject into the compressed context so the agent doesn't lose
+        # track of the current task after compaction discards the original messages.
+        try:
+            _hermes_home = getattr(self, '_hermes_home', None)
+            if _hermes_home is None:
+                from hermes_cli.config import get_hermes_home
+                _hermes_home = Path(str(get_hermes_home()))
+            _checkpoint_path = _hermes_home / "state" / "compaction_checkpoint.json"
+            if _checkpoint_path.exists():
+                import json as _json
+                with open(_checkpoint_path, "r", encoding="utf-8") as _f:
+                    _ck = _json.load(_f)
+                _recent = _ck.get("recent_messages", [])
+                _recent_tools = _ck.get("recent_tools", [])
+                if _recent:
+                    # Build a clear handoff message with the pre-compression state
+                    _lines = ["[CONTEXT COMPACTION HANDOFF] — Before compression, you were working on:\n"]
+                    for _msg in _recent:
+                        _role = _msg.get("role", "unknown")
+                        _content = _msg.get("content", "")
+                        _lines.append(f"**{_role}**: {_content[:400]}")
+                    if _recent_tools:
+                        _lines.append("\n**Recent tool activity:**")
+                        for _t in _recent_tools[:3]:
+                            _lines.append(f"- {_t.get('tool')}: {_t.get('result_preview', '')[:150]}")
+                    _handoff = "\n".join(_lines)
+                    # Inject right after the head messages (before summary at index compress_start)
+                    _inject_idx = self.context_compressor.protect_first_n
+                    # Find actual inject position — skip any existing system note at head
+                    while _inject_idx < len(compressed) and compressed[_inject_idx].get("role") == "system":
+                        _inject_idx += 1
+                    compressed.insert(_inject_idx, {"role": "user", "content": _handoff})
+                    logger.info("[COMPACTION HANDOFF] Injected %d pre-compression messages at index %d", len(_recent), _inject_idx)
+                # Clean up checkpoint file after injection
+                try:
+                    _checkpoint_path.unlink()
+                except Exception:
+                    pass
+        except Exception as _e:
+            logger.warning("[COMPACTION HANDOFF] Failed to inject checkpoint: %s", _e)
+
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
         self._cached_system_prompt = new_system_prompt
